@@ -4,15 +4,23 @@
 <body><h1>公共交通中断改道发布</h1><p>示例线路中 S1 到 S5 的基线路径耗时 23 分钟。新建临时停运方案后，可比较改道路径，并按草稿、复核、批准、发布流程处理。</p>
 <div class="card"><h2>身份与版本</h2><input id="user" value="planner-01"><select id="role"><option>planner</option><option>reviewer</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button></div>
 <div class="card"><h2>路径查询</h2><label>起点 <input id="from" type="number" value="1"></label><label>终点 <input id="to" type="number" value="5"></label><label>服务日分钟 <input id="at" type="number" value="1430"></label><label><input id="accessible" type="checkbox">仅无障碍</label><button onclick="routeBase()">基线路径</button><button onclick="routeVersion()">版本路径</button><pre id="routeResult">等待查询…</pre></div>
-<div class="card"><h2>方案状态</h2><button onclick="action('submit')">提交复核</button><button onclick="action('approve')">批准</button><button onclick="action('publish')">发布</button><pre id="stateResult"></pre></div>
+<div class="card"><h2>方案状态</h2><button onclick="action('submit')">提交复核</button><button onclick="action('approve')">批准</button><button onclick="action('publish')">发布</button><button onclick="checkConflicts()">冲突检查</button><pre id="stateResult"></pre><div id="conflictBox" style="display:none;border:1px solid #d9534f;border-radius:8px;padding:10px 14px;margin-top:8px;background:#fdf1f1"><strong style="color:#b02a37">同线路站点时段冲突，不能进入复核/发布：</strong><pre id="conflictResult"></pre></div></div>
 <div class="card"><h2>数据</h2><button onclick="trips()">跨日班次</button><button onclick="errors()">坏数据记录</button><pre id="data">等待操作…</pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
-async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
+async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok){const e=Error(j.error||r.status);e.body=j;throw e}return j}
+function renderConflicts(items){
+  if(!items||!items.length){conflictBox.style.display='none';conflictResult.textContent='';return}
+  conflictBox.style.display='block';
+  conflictResult.textContent=items.map(c=>`中断 ${c.disruption_code} · 冲突版本 v${c.version_no}（版本ID ${c.version_id}，${c.status}）`+
+    `\n  线路ID: ${c.line_id===null?'未指定（全线）':c.line_id} · 站点ID: ${c.stop_id} · 重叠: ${c.overlap_minutes} 分钟`+
+    `\n  本版窗口: ${c.window.start_minute}-${c.window.end_minute} · 冲突版本窗口: ${c.other_window.start_minute}-${c.other_window.end_minute}`).join('\n');
+}
+async function checkConflicts(){try{const j=await call('/api/versions/'+version.value+'/conflicts');renderConflicts(j.items);stateResult.textContent=j.items.length?('发现 '+j.items.length+' 处冲突'):'无冲突，可以送审'}catch(e){renderConflicts([]);stateResult.textContent=e.message}}
 async function routeBase(){try{routeResult.textContent=JSON.stringify(await call('/api/route?from='+from.value+'&to='+to.value+'&at_minute='+at.value+(accessible.checked?'&accessible=true':'')),null,2)}catch(e){routeResult.textContent=e.message}}
 async function routeVersion(){try{routeResult.textContent=JSON.stringify(await call('/api/route?from='+from.value+'&to='+to.value+'&version_id='+version.value+'&at_minute='+at.value+(accessible.checked?'&accessible=true':'')),null,2)}catch(e){routeResult.textContent=e.message}}
-async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2)}catch(e){stateResult.textContent=e.message}}
+async function action(name){try{const j=await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'});renderConflicts([]);stateResult.textContent=JSON.stringify(j,null,2)}catch(e){if(e.body&&e.body.conflicts)renderConflicts(e.body.conflicts);stateResult.textContent=e.message}}
 async function trips(){try{data.textContent=JSON.stringify(await call('/api/trips/1'),null,2)}catch(e){data.textContent=e.message}}
 async function errors(){try{data.textContent=JSON.stringify(await call('/api/import-errors'),null,2)}catch(e){data.textContent=e.message}}
-async function refresh(){try{data.textContent=JSON.stringify({lines:await call('/api/lines'),stops:await call('/api/stops'),versions:await call('/api/versions')},null,2)}catch(e){data.textContent=e.message}}
+async function refresh(){try{const detail=await call('/api/versions/'+version.value);renderConflicts(detail.conflicts);data.textContent=JSON.stringify({lines:await call('/api/lines'),stops:await call('/api/stops'),versions:await call('/api/versions'),current:detail},null,2)}catch(e){renderConflicts([]);data.textContent=e.message}}
 </script></body></html>

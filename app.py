@@ -17,6 +17,12 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "transit_disruption.db"
 
+# Changes without an explicit effective window apply for the whole service
+# day; the domain timeline runs from 0 to 2880 minutes (cross-midnight trips
+# may run past 1440), so use that span when measuring overlaps.
+FULL_SERVICE_START = 0
+FULL_SERVICE_END = 2880
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -43,9 +49,10 @@ def _within_window(value: int, start: int | None, end: int | None) -> bool:
 
 
 class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
+        self.details = details or {}
 
 
 class Database:
@@ -358,6 +365,13 @@ class Database:
             if action == "submit":
                 if status != "draft" or role not in {"planner", "editor", "admin"}:
                     raise DomainError("只有草稿版本可以提交复核", 409)
+                conflicts = self.find_version_conflicts(version_id)
+                if conflicts:
+                    raise DomainError(
+                        "存在同线路同站点时段冲突，不能提交复核",
+                        409,
+                        {"conflicts": conflicts},
+                    )
                 conn.execute("UPDATE versions SET status='review',submitted_by=?,updated_at=? WHERE id=?", (actor, utcnow(), version_id))
             elif action == "reject":
                 if status != "review" or role not in {"reviewer", "admin"}:
@@ -374,6 +388,15 @@ class Database:
             elif action == "publish":
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
+                # Re-check at publication time: a competing version may have
+                # been approved or published while this one was in review.
+                conflicts = self.find_version_conflicts(version_id)
+                if conflicts:
+                    raise DomainError(
+                        "审批期间同线路站点时段已被其他版本占用，不能发布",
+                        409,
+                        {"conflicts": conflicts},
+                    )
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
                 snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
                 snapshot_text = canonical(snapshot)
@@ -382,7 +405,97 @@ class Database:
             else:
                 raise DomainError("未知状态操作")
             self._audit(conn, actor, f"version.{action}", "version", version_id, {})
-        return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
+            result = dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
+        return result
+
+    @staticmethod
+    def _change_window(row: sqlite3.Row) -> tuple[int, int]:
+        """Effective window of a change; an unset window covers the full service day."""
+        start, end = row["effective_start_minute"], row["effective_end_minute"]
+        if start is None or end is None:
+            return FULL_SERVICE_START, FULL_SERVICE_END
+        return int(start), int(end)
+
+    @staticmethod
+    def _change_stops(row: sqlite3.Row) -> set[int]:
+        """Stops occupied by a change. A detour occupies both bypass endpoints."""
+        kind = row["kind"]
+        if kind == "detour":
+            return {int(row["from_stop_id"]), int(row["to_stop_id"])}
+        if kind in {"stop_closure", "skip_stop", "accessibility_change"}:
+            return {int(row["stop_id"])}
+        return set()
+
+    @staticmethod
+    def _line_scopes_overlap(left: int | None, right: int | None) -> bool:
+        # A change without a line applies line-wide (same semantics as routing),
+        # so it conflicts with every line; explicit lines must be identical.
+        return left is None or right is None or left == right
+
+    def find_version_conflicts(self, version_id: int) -> list[dict[str, Any]]:
+        """Compare every change of a version against approved/published versions.
+
+        Only versions belonging to *other* disruption events are compared:
+        versions copied within one event form a single lineage and supersede
+        each other instead of occupying the same stops twice.
+        """
+        with self.connect() as conn:
+            version = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+            if not version:
+                raise DomainError("方案版本不存在", 404)
+            mine = conn.execute("SELECT * FROM changes WHERE version_id=?", (version_id,)).fetchall()
+            if not mine:
+                return []
+            others = conn.execute(
+                """SELECT c.*, v.version_no other_version_no, v.id other_version_id,
+                          v.status other_status, d.id other_disruption_id, d.code other_disruption_code
+                     FROM changes c
+                     JOIN versions v ON v.id = c.version_id
+                     JOIN disruptions d ON d.id = v.disruption_id
+                    WHERE v.disruption_id != ?
+                      AND v.status IN ('approved','published')""",
+                (version["disruption_id"],),
+            ).fetchall()
+            conflicts: list[dict[str, Any]] = []
+            seen: set[tuple[Any, ...]] = set()
+            for mine_change in mine:
+                my_stops = self._change_stops(mine_change)
+                if not my_stops:
+                    continue
+                my_start, my_end = self._change_window(mine_change)
+                for other in others:
+                    if not self._line_scopes_overlap(mine_change["line_id"], other["line_id"]):
+                        continue
+                    overlap_stops = my_stops & self._change_stops(other)
+                    if not overlap_stops:
+                        continue
+                    other_start, other_end = self._change_window(other)
+                    overlap = min(my_end, other_end) - max(my_start, other_start)
+                    if overlap <= 0:
+                        continue
+                    line_id = mine_change["line_id"] if mine_change["line_id"] is not None else other["line_id"]
+                    for stop_id in sorted(overlap_stops):
+                        key = (other["other_version_id"], stop_id, line_id, my_start, my_end,
+                               other_start, other_end, mine_change["id"], other["id"])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        conflicts.append({
+                            "version_id": int(other["other_version_id"]),
+                            "version_no": int(other["other_version_no"]),
+                            "disruption_id": int(other["other_disruption_id"]),
+                            "disruption_code": other["other_disruption_code"],
+                            "line_id": line_id,
+                            "stop_id": int(stop_id),
+                            "overlap_minutes": int(overlap),
+                            "window": {"start_minute": my_start, "end_minute": my_end},
+                            "other_window": {"start_minute": other_start, "end_minute": other_end},
+                            "status": other["other_status"],
+                            "change_id": int(mine_change["id"]),
+                            "other_change_id": int(other["id"]),
+                        })
+            conflicts.sort(key=lambda c: (c["disruption_id"], c["version_id"], c["stop_id"], c["change_id"]))
+            return conflicts
 
     def _base_hash(self, conn: sqlite3.Connection) -> str:
         lines = [dict(r) for r in conn.execute("SELECT * FROM lines ORDER BY id")]
@@ -535,7 +648,8 @@ class Database:
             result["changes"] = changes
             if result["snapshot"]:
                 result["snapshot"] = json.loads(result["snapshot"])
-            return result
+        result["conflicts"] = self.find_version_conflicts(version_id)
+        return result
 
     def list_import_errors(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -609,6 +723,14 @@ class Handler(BaseHTTPRequestHandler):
     def _auth(self) -> tuple[str, str]:
         return self.headers.get("X-User", "anonymous"), self.headers.get("X-Role", "viewer")
 
+    @staticmethod
+    def _error_payload(exc: Exception) -> dict[str, Any]:
+        payload: dict[str, Any] = {"error": str(exc)}
+        details = getattr(exc, "details", None)
+        if details:
+            payload.update(details)
+        return payload
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
@@ -628,6 +750,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path in endpoints:
                 return self._send({"items": endpoints[parsed.path]()})
             parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "conflicts":
+                return self._send({"items": self.db.find_version_conflicts(int(parts[2]))})
             if len(parts) == 3 and parts[:2] == ["api", "versions"]:
                 return self._send(self.db.get_version(int(parts[2])))
             if len(parts) == 3 and parts[:2] == ["api", "trips"]:
@@ -639,7 +763,7 @@ class Handler(BaseHTTPRequestHandler):
                                                 int(q.get("at_minute", ["0"])[0]), q.get("accessible", ["false"])[0].lower() == "true"))
             raise DomainError("接口不存在", 404)
         except (KeyError, ValueError, DomainError) as exc:
-            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+            self._send(self._error_payload(exc), getattr(exc, "status", 400))
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -661,7 +785,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.transition(int(parts[2]), actor, role, parts[3]))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
-            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+            self._send(self._error_payload(exc), getattr(exc, "status", 400))
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[transit] {self.address_string()} - {fmt % args}")
